@@ -1,0 +1,398 @@
+using System;
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Linq;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
+using ChatRoom.Models;
+using ChatRoom.Services;
+
+namespace ChatRoom
+{
+    /// <summary>
+    /// MainWindow 的第三阶段扩展（partial，独立文件，尽量不改主文件）：
+    ///   · 历史搜索（Ctrl+F / 顶栏 🔍）：把消息列表临时切换成"命中列表"，关闭即恢复
+    ///   · emoji 面板（Ctrl+E / 输入区 😀）：本地 Unicode，无网络依赖
+    ///   · 键盘操作：Ctrl+F 搜索、Ctrl+E emoji、Esc 关闭/清空、↑↓ 选会话
+    ///   · 托盘增强：图标 + 未读数提示 + 右键菜单（显示/隐藏、设置、退出）+ 双击唤回
+    ///
+    /// 为什么单独成文件：主窗口文件已经很大，而且它是我和豆包都要小心的地方；
+    /// 新增功能放 partial 里，冲突面最小。
+    /// </summary>
+    public partial class MainWindow
+    {
+        // ==================== 历史搜索 ====================
+
+        private readonly ObservableCollection<ChatMessageItem> _searchView = new ObservableCollection<ChatMessageItem>();
+        private bool _searchMode = false;
+
+        /// <summary>窗口加载完成后做一次性装配（搜索框、emoji 面板、托盘）</summary>
+        private void Extras_Loaded(object sender, RoutedEventArgs e)
+        {
+            BuildEmojiPanel();
+            InitTray();
+            // 会话分离：启动即建立群聊会话并套用过滤，避免启动时显示全部会话的消息
+            EnsureConversation(Conversation.GroupKey, "群聊", true, "");
+            RefreshConversationView();
+            StartUserSync();
+            ApplyWallpaper();   // 需求#7：启动时恢复聊天区壁纸
+            Anim.ApplyTo(this);  // 动效总开关（豆包 Q7）：附加属性设一次，子元素靠继承拿到
+            // 系统关机/注销时必须放行关闭，否则会被"此程序阻止关机"卡住
+            // ★ 用具名方法而不是 lambda：Application.SessionEnding 是静态事件，
+            //   匿名订阅没法退订，会让已关闭的窗口一直被 Application 引用（第三轮审查）
+            Application.Current.SessionEnding += OnSessionEnding;
+        }
+
+        private void BtnSearch_Click(object sender, RoutedEventArgs e)
+        {
+            if (_searchMode) CloseSearch();
+            else OpenSearch();
+        }
+
+        private void OpenSearch()
+        {
+            _searchMode = true;
+            SearchBar.Visibility = Visibility.Visible;
+            SearchBox.Focus();
+            SearchBox.SelectAll();
+            RunSearch();
+        }
+
+        private void CloseSearch()
+        {
+            _searchMode = false;
+            SearchBar.Visibility = Visibility.Collapsed;
+            SearchBox.Text = "";
+            ChatItems.ItemsSource = _messages;      // 恢复完整列表（搜索期间新消息仍进 _messages）
+            ChatScroll.ScrollToEnd();
+        }
+
+        private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (_searchMode) RunSearch();
+        }
+
+        private void SearchBox_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Escape) { CloseSearch(); e.Handled = true; }
+        }
+
+        private void BtnSearchClose_Click(object sender, RoutedEventArgs e)
+        {
+            CloseSearch();
+        }
+
+        /// <summary>在内存消息里做不区分大小写的包含搜索，命中列表直接替换显示源</summary>
+        private void RunSearch()
+        {
+            string q = (SearchBox.Text ?? "").Trim();
+            _searchView.Clear();
+
+            if (q.Length > 0)
+            {
+                foreach (ChatMessageItem m in _messages)
+                {
+                    if (m.IsImage) continue;
+                    if ((m.Message ?? "").IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0
+                        || (m.Sender ?? "").IndexOf(q, StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        _searchView.Add(m);
+                    }
+                }
+            }
+
+            ChatItems.ItemsSource = _searchView;
+            TextSearchInfo.Text = q.Length == 0
+                ? "输入关键词搜索聊天记录"
+                : ("找到 " + _searchView.Count + " 条");
+        }
+
+        // ==================== emoji 面板 ====================
+
+        private void BuildEmojiPanel()
+        {
+            if (EmojiPanel == null || EmojiPanel.Children.Count > 0) return;
+
+            // Win7 没有 Segoe UI Emoji（也没有任何彩色 emoji 字体），U+1F600 以上的字符会显示成方框。
+            // => 老系统改用 BMP 区段的符号集（Segoe UI Symbol / Arial Unicode 都自带），字体写成回退链。
+            bool legacy = Environment.OSVersion.Version < new Version(6, 2);   // 6.2 = Windows 8
+            string[] emojis = legacy ? new[]
+            {
+                "☺","☻","☹","☀","☁","☂","☃","★","☆","♥","♦","♣","♠","♪","♫","✿",
+                "✔","✖","✚","❄","❖","●","○","◆","◇","■","□","▲","▼","◀","▶","※",
+                "←","→","↑","↓","↔","↕","➤","⚠","⚡","⚙","⚔","⚖","⌛","☕","☎","✎",
+                "①","②","③","④","⑤","⑥","⑦","⑧","⑨","⑩","⑪","⑫","⑬","⑭","⑮","⑯"
+            } : new[]
+            {
+                "😀","😄","😁","😆","😅","😂","🙂","😉","😊","😍","😘","😜","🤔","😐","😴","😭",
+                "😡","👍","👎","👌","✌️","🙏","👏","💪","🤝","❤️","💔","⭐","🔥","✨","🎉","🎁",
+                "🍚","🍜","🍎","☕","⚽","🎮","📚","💻","📱","🌈","☀️","🌙","⚡","💧","🌸","🍀",
+                "✅","❌","❓","❗","⚠️","🔔","📢","🎵","🚀","🏆","💰","🕐","📍","📷","📎","💬"
+            };
+
+            foreach (string s in emojis)
+            {
+                var b = new Button
+                {
+                    Content = s,
+                    Width = 34,
+                    Height = 32,
+                    Margin = new Thickness(1),
+                    FontSize = 17,
+                    // 字体回退链：Win8.1+ 用 Segoe UI Emoji（彩色）；Win7 只能靠 Segoe UI Symbol
+                    FontFamily = new FontFamily(legacy ? "Segoe UI Symbol, Arial Unicode MS, Segoe UI" : "Segoe UI Emoji, Segoe UI Symbol, Segoe UI"),
+                    Background = Brushes.Transparent,
+                    BorderThickness = new Thickness(0),
+                    Cursor = Cursors.Hand,
+                    ToolTip = s
+                };
+                b.Click += Emoji_Click;
+                EmojiPanel.Children.Add(b);
+            }
+        }
+
+        private void BtnEmoji_Click(object sender, RoutedEventArgs e)
+        {
+            EmojiPopup.IsOpen = !EmojiPopup.IsOpen;
+            if (EmojiPopup.IsOpen) BuildEmojiPanel();
+        }
+
+        /// <summary>把 emoji 插到光标处（不是简单追加，保持用户正在编辑的位置）</summary>
+        private void Emoji_Click(object sender, RoutedEventArgs e)
+        {
+            var b = sender as Button;
+            if (b == null) return;
+            string s = b.Content as string ?? "";
+            if (s.Length == 0) return;
+
+            InputBox.Text = InputBox.Text.Insert(InputBox.CaretIndex, s);
+            InputBox.CaretIndex += s.Length;
+            InputBox.Focus();
+            EmojiPopup.IsOpen = false;
+        }
+
+        // ==================== 键盘操作 ====================
+
+        /// <summary>
+        /// 窗口级快捷键（用 PreviewKeyDown，不干扰输入框自己的 Enter 发送逻辑）。
+        /// Ctrl+F 搜索 / Ctrl+E emoji / Esc 关搜索或清空输入 / ↑↓ 切换会话。
+        /// </summary>
+        private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            bool ctrl = (Keyboard.Modifiers & ModifierKeys.Control) == ModifierKeys.Control;
+
+            if (ctrl && e.Key == Key.F) { OpenSearch(); e.Handled = true; return; }
+            if (ctrl && e.Key == Key.E) { BtnEmoji_Click(null, null); e.Handled = true; return; }
+
+            if (e.Key == Key.Escape)
+            {
+                if (EmojiPopup != null && EmojiPopup.IsOpen) { EmojiPopup.IsOpen = false; e.Handled = true; return; }
+                if (_searchMode) { CloseSearch(); e.Handled = true; return; }
+                if (InputBox.Text.Length > 0) { InputBox.Clear(); e.Handled = true; return; }
+                return;
+            }
+
+            // 输入框获得焦点时不抢上下键（要留给文本光标移动）
+            if (InputBox.IsKeyboardFocusWithin) return;
+
+            if (e.Key == Key.Up || e.Key == Key.Down)
+            {
+                if (_userList.Count == 0) return;
+                int idx = UserList.SelectedIndex;
+                idx += (e.Key == Key.Down) ? 1 : -1;
+                if (idx < 0) idx = _userList.Count - 1;
+                if (idx >= _userList.Count) idx = 0;
+                UserList.SelectedIndex = idx;
+                UserList.ScrollIntoView(UserList.SelectedItem);
+                e.Handled = true;
+            }
+        }
+
+        // ==================== 托盘增强 ====================
+
+        private System.Windows.Forms.NotifyIcon _tray;
+        private bool _trayReady = false;   // 只有全部装配完成才算可用（_tray != null 无法区分半成品）
+        private DispatcherTimer _trayTimer;
+
+        private void InitTray()
+        {
+            try
+            {
+                _tray = new System.Windows.Forms.NotifyIcon
+                {
+                    Icon = LoadTrayIcon(),
+                    Text = "小小聊天",
+                    Visible = true
+                };
+
+                var menu = new System.Windows.Forms.ContextMenuStrip();
+                menu.Items.Add("显示 / 隐藏窗口", null, (s, a) => ToggleWindowVisible());
+                menu.Items.Add("设置…", null, (s, a) => BtnSettings.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)));
+                menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+                menu.Items.Add("退出", null, (s, a) => { _isExiting = true; Application.Current.Shutdown(); });
+                _tray.ContextMenuStrip = menu;
+
+                _tray.DoubleClick += (s, a) => { Show(); WindowState = WindowState.Normal; Activate(); };
+
+                // 未读数同步到托盘提示（NotifyIcon.Text 上限 63 字符，这里很短）
+                _trayTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+                _trayTimer.Tick += (s, a) =>
+                {
+                    if (_tray == null) return;
+                    _tray.Text = _unreadCount > 0 ? ("小小聊天 · " + _unreadCount + " 条新消息") : "小小聊天";
+                };
+                _trayTimer.Start();
+                _trayReady = true;   // 走到这里才算托盘真的可用
+
+                Closed += (s, a) =>
+                {
+                    try { if (_trayTimer != null) _trayTimer.Stop(); } catch { }
+                    try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); _tray = null; } } catch { }
+                };
+            }
+            catch (Exception)
+            {
+                // 托盘失败必须让用户知道：关闭到托盘会让窗口"藏了唤不回"，所以关闭逻辑会退化为直接退出
+                // 半成品托盘要清掉，否则图标会残留且没有菜单/双击
+                try { if (_tray != null) { _tray.Visible = false; _tray.Dispose(); _tray = null; } } catch { }
+                _trayReady = false;
+                // 用可见提示（ChatRoom 没有日志系统）：用户需要知道"关闭会直接退出"
+                try { AddMessage("系统", "托盘图标创建失败，关闭窗口将直接退出程序", BubbleKind.Service); } catch { }
+            }
+        }
+
+        /// <summary>系统关机/注销：放行关闭，避免"此程序阻止关机"</summary>
+        private void OnSessionEnding(object sender, SessionEndingCancelEventArgs e)
+        {
+            _isExiting = true;
+        }
+
+        private DispatcherTimer _userSyncTimer;
+
+        /// <summary>
+        /// 定时把服务端的用户态同步回 UI 列表。
+        /// 必须做：UI 里的 ChatUser 是"加入时"的快照，LastSeen 不会自己变 ⇒ 8 秒后 IsOnline 恒为 false，
+        /// 会导致在线点变灰、在线数变 0，以及"选中的私聊对象被误判离线"（曾经因此把私密图片改成群发）。
+        /// </summary>
+        private void StartUserSync()
+        {
+            _userSyncTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+            _userSyncTimer.Tick += (s, a) => SyncUserListFromService();
+            _userSyncTimer.Start();
+            Closed += (s, a) => { try { if (_userSyncTimer != null) _userSyncTimer.Stop(); } catch { } };
+        }
+
+        private void SyncUserListFromService()
+        {
+            if (_chat == null) return;
+            try
+            {
+                var live = _chat.SnapshotUsers();
+                bool needRefresh = false;
+                bool countChanged = false;
+
+                // 更新已有用户
+                foreach (ChatUser u in _userList)
+                {
+                    bool wasOnline = u.IsOnline;
+                    foreach (ChatUser s in live)
+                    {
+                        if (s.IP == u.IP)
+                        {
+                            u.LastSeen = s.LastSeen;
+                            if (u.Nickname != s.Nickname) { u.Nickname = s.Nickname; needRefresh = true; }
+                            break;
+                        }
+                    }
+                    // 在线状态翻转才需要刷新（绿灯变灰/灰变绿）
+                    if (u.IsOnline != wasOnline) needRefresh = true;
+                }
+
+                // 新上线的人加入列表
+                foreach (ChatUser s in live)
+                {
+                    // ★ 侧栏只列**别人**：服务侧的 _users 里有一条 IsMe 的"我自己"
+                    //   （启动时为了标识本机加进去的），这里必须过滤掉，
+                    //   否则会出现"登录后侧栏冒出自己、过 8 秒又消失"（用户实测反馈）。
+                    //   为什么会消失：自己那条的 LastSeen 只在启动时设过一次、之后无人刷新
+                    //   （所有处理器对自己 IP 都是直接 return，清理循环也跳过 IsMe），
+                    //   于是 8 秒后 IsOnline 变 false，UI 的"移除离线用户"就把它删了。
+                    if (s.IsMe) continue;
+
+                    bool found = false;
+                    foreach (ChatUser u in _userList) { if (u.IP == s.IP) { found = true; break; } }
+                    if (!found)
+                    {
+                        // ★ 第三轮复核修复①：他离线时那一行被移除了，行上的红点随之消失，
+                        //   但**会话里的未读还在** —— 重新上线要从会话未读恢复，
+                        //   否则侧栏红点凭空不见，而顶栏总数还数着它（两处不一致）。
+                        Conversation pc;
+                        if (_conversations.TryGetValue(Conversation.PeerKey(s.IP), out pc) && pc.Unread > 0)
+                            s.Unread = pc.Unread;
+
+                        _userList.Add(s);
+                        needRefresh = true; countChanged = true;
+
+                        // ★ 修复②：如果用户正开着和这个人的私聊，_currentTarget 还指着**旧的**（已离线的）对象，
+                        //   发消息会走"对方似乎已离线，是否改群发"那条询问分支 —— 换成新对象并重新选中。
+                        if (_currentConvKey == Conversation.PeerKey(s.IP))
+                        {
+                            _currentTarget = s;
+                            UserList.SelectedItem = s;   // 触发 SelectionChanged → 回到该会话（正在看，未读随之清零，符合预期）
+                        }
+                    }
+                }
+
+                // 离线超时的人从列表移除；自己那条（IsMe）永远不该在侧栏里，一并兜底清掉
+                for (int i = _userList.Count - 1; i >= 0; i--)
+                {
+                    if (_userList[i].IsMe || !_userList[i].IsOnline)
+                    {
+                        _userList.RemoveAt(i); needRefresh = true; countChanged = true;
+                    }
+                }
+
+                if (countChanged) UpdateUserCount();
+                if (needRefresh)
+                    System.Windows.Data.CollectionViewSource.GetDefaultView(_userList).Refresh();
+
+                // 动效 4：同步各行未读跑马灯
+                // （未读变化时 UpdateUnreadBadge 已经会即时对齐，这里兜底一次，
+                //   覆盖"行刚被创建/移除"这类不经过未读逻辑的变化）
+                SyncMarquees();
+            }
+            catch { }
+        }
+
+        private void ToggleWindowVisible()
+        {
+            if (IsVisible) Hide();
+            else { Show(); WindowState = WindowState.Normal; Activate(); }
+        }
+
+        /// <summary>取程序图标；取不到就退回系统默认图标（不让托盘初始化失败）</summary>
+        private System.Drawing.Icon LoadTrayIcon()
+        {
+            try
+            {
+                var uri = new Uri("pack://application:,,,/ChatRoom;component/Assets/chat.ico");
+                var stream = Application.GetResourceStream(uri);
+                if (stream != null) return new System.Drawing.Icon(stream.Stream);
+            }
+            catch { }
+
+            try
+            {
+                string p = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Assets", "chat.ico");
+                if (File.Exists(p)) return new System.Drawing.Icon(p);
+            }
+            catch { }
+
+            return System.Drawing.SystemIcons.Application;
+        }
+    }
+}
