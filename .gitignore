@@ -49,3 +49,6 @@ TestResult*/
 *.bak
 *.tmp
 *.temp
+
+# 项目交流（本地资料，不入库）
+项目交流/
